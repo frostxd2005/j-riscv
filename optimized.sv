@@ -1,4 +1,33 @@
 `timescale 1ns / 1ps
+//CHANGES: 
+// 1. VERILATOR LINT PRAGMAS (Added for clean synthesis):
+// - Added /* verilator lint_off UNUSEDSIGNAL */ to suppress unused signal warnings
+// - Added /* verilator lint_off SYNCASYNCNET */ to suppress async reset warnings
+// - Added /* verilator lint_off COMBDLY */ to suppress combinational delay warnings
+//
+// 2. BYTE/HALFWORD LOAD/STORE SUPPORT (NEW):
+// - Added mem_size[1:0] input to memory module (00=byte, 01=halfword, 10=word)
+// - Added mem_sign input to memory module (0=unsigned, 1=signed)
+// - Added byte load support: lb (signed byte), lbu (unsigned byte)
+// - Added halfword load support: lh (signed halfword), lhu (unsigned halfword)
+// - Added byte store support: sb (8-bit store)
+// - Added halfword store support: sh (16-bit store)
+// - Added sign extension logic for signed loads (lb, lh)
+// - Modified memory module to be byte-addressable (4KB = 4096 bytes)
+// - Modified control FSM to decode funct3 for memory size and sign extension
+// - Added mem_size and mem_sign outputs from control FSM
+//
+// 3. MEMORY INTERFACE:
+// - Behavioral memory model (for STA analysis)
+// - Byte-addressable memory (4096 bytes = 4KB)
+// - Asynchronous read (combinational)
+// - Synchronous write (clocked)
+// - Supports byte, halfword, and word accesses
+// ============================================================================
+
+/* verilator lint_off UNUSEDSIGNAL */
+/* verilator lint_off SYNCASYNCNET */
+/* verilator lint_off COMBDLY */
 
 // RISC-V Multicycle CPU - Optimized Design with Prefetch
 //
@@ -106,13 +135,16 @@ module prefetch_buffer (
     logic [31:0] buffer_reg;
     logic valid_reg;
 
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst || invalidate) begin
-            // Reset or invalidate: clear buffer
+    // FIXED: Make both rst and invalidate async (both in sensitivity list)
+    // This fixes Yosys synthesis error: "Multiple edge sensitive events"
+    always_ff @(posedge clk or posedge rst or posedge invalidate) begin
+        if (rst) begin
+            buffer_reg <= 32'h0;
+            valid_reg <= 1'b0;
+        end else if (invalidate) begin
             buffer_reg <= 32'h0;
             valid_reg <= 1'b0;
         end else if (we) begin
-            // Write enable: load new instruction
             buffer_reg <= instruction_in;
             valid_reg <= 1'b1;
         end
@@ -139,38 +171,96 @@ module program_counter (
 
 endmodule
 
-// Unified instruction/data memory with asynchronous reads
-// - ASYNCHRONOUS READ: Data available immediately (combinational - critical for S_BRANCH_TAKEN_FETCH optimization)
-// - SYNCHRONOUS WRITE: Data written on clock edge
-// - Loads program from program.mem file at startup
+// ============================================================================
+// MEMORY MODULE - BEHAVIORAL MODEL WITH BYTE/HALFWORD SUPPORT
+// ============================================================================
+// This behavioral model supports:
+// - Word (32-bit) loads and stores (lw, sw)
+// - Halfword (16-bit) loads and stores (lh, lhu, sh)
+// - Byte (8-bit) loads and stores (lb, lbu, sb)
+// - Sign extension for lh, lb
+// ============================================================================
 module memory #(
     parameter DEPTH = 1024
 )(
     input logic clk,
     input logic memread, memwrite,
     input logic [31:0] addr_in, data_in,
+    input logic [1:0] mem_size,  // 00=byte, 01=halfword, 10=word
+    input logic mem_sign,         // 0=unsigned, 1=signed (for loads)
     output logic [31:0] data_out
 );
 
-    logic [31:0] memblock [0:DEPTH-1];
+    logic [7:0] memblock [0:DEPTH*4-1];  // Byte-addressable memory
 
+    // Initialize memory with test program (optional)
+    //Comment this for synthesis
     initial begin
-        $readmemh("program1.mem", memblock);
+        $readmemh("program.mem", memblock);
     end
 
-    // ASYNCHRONOUS READ (combinational) - data available immediately
-    // This enables fetching instruction in same cycle as branch target calculation
+    // ASYNCHRONOUS READ with byte/halfword support
     always_comb begin
-        if (memread)
-            data_out = memblock[addr_in[$clog2(DEPTH)+1:2]];
-        else
+        if (memread) begin
+            case (mem_size)
+                2'b00: begin  // Byte load (lb, lbu)
+                    if (mem_sign) begin
+                        // Signed byte load (sign extend)
+                        data_out = {{24{memblock[addr_in][7]}}, memblock[addr_in]};
+                    end else begin
+                        // Unsigned byte load (zero extend)
+                        data_out = {24'b0, memblock[addr_in]};
+                    end
+                end
+                2'b01: begin  // Halfword load (lh, lhu)
+                    if (mem_sign) begin
+                        // Signed halfword load (sign extend)
+                        data_out = {{16{memblock[addr_in+1][7]}}, 
+                                   memblock[addr_in+1], memblock[addr_in]};
+                    end else begin
+                        // Unsigned halfword load (zero extend)
+                        data_out = {16'b0, memblock[addr_in+1], memblock[addr_in]};
+                    end
+                end
+                2'b10: begin  // Word load (lw)
+                    data_out = {memblock[addr_in+3], memblock[addr_in+2], 
+                               memblock[addr_in+1], memblock[addr_in]};
+                end
+                default: begin
+                    data_out = {memblock[addr_in+3], memblock[addr_in+2], 
+                               memblock[addr_in+1], memblock[addr_in]};
+                end
+            endcase
+        end else begin
             data_out = 32'hx;
+        end
     end
 
-    // SYNCHRONOUS WRITE - data written on clock edge
+    // SYNCHRONOUS WRITE with byte/halfword support
     always_ff @(posedge clk) begin
-        if (memwrite)
-            memblock[addr_in[$clog2(DEPTH)+1:2]] <= data_in;
+        if (memwrite) begin
+            case (mem_size)
+                2'b00: begin  // Byte store (sb)
+                    memblock[addr_in] <= data_in[7:0];
+                end
+                2'b01: begin  // Halfword store (sh)
+                    memblock[addr_in] <= data_in[7:0];
+                    memblock[addr_in+1] <= data_in[15:8];
+                end
+                2'b10: begin  // Word store (sw)
+                    memblock[addr_in] <= data_in[7:0];
+                    memblock[addr_in+1] <= data_in[15:8];
+                    memblock[addr_in+2] <= data_in[23:16];
+                    memblock[addr_in+3] <= data_in[31:24];
+                end
+                default: begin
+                    memblock[addr_in] <= data_in[7:0];
+                    memblock[addr_in+1] <= data_in[15:8];
+                    memblock[addr_in+2] <= data_in[23:16];
+                    memblock[addr_in+3] <= data_in[31:24];
+                end
+            endcase
+        end
     end
 
 endmodule
@@ -319,9 +409,9 @@ module immediate_gen (
         case (instruction[6:2])
             5'b01100: immediate = 32'b0;  // R-type: no immediate
             5'b00100: immediate = { {20{instruction[31]}}, instruction[31:20] };  // I-type ALU sign extend in all I, Load, and JALR instructions
-            5'b00000: immediate = { {20{instruction[31]}}, instruction[31:20] };  // Load
+            5'b00000: immediate = { {20{instruction[31]}}, instruction[31:20] };  // Load (lb, lh, lw, lbu, lhu)
             5'b11001: immediate = { {20{instruction[31]}}, instruction[31:20] };  // JALR
-            5'b01000: immediate = { {20{instruction[31]}}, instruction[31:25], instruction[11:7] };  // Store
+            5'b01000: immediate = { {20{instruction[31]}}, instruction[31:25], instruction[11:7] };  // Store (sb, sh, sw)
             5'b11000: immediate = { {19{instruction[31]}}, instruction[31], instruction[7], instruction[30:25], instruction[11:8], 1'b0 } - 32'd4;  // Branch (adjusted -4)
             5'b01101: immediate = { instruction[31:12], 12'b0 };  // LUI load upper immediate
             5'b00101: immediate = { instruction[31:12], 12'b0 } - 32'd4;  // AUIPC add upper immediate to program counter(adjusted -4)
@@ -378,9 +468,6 @@ module alu_cntrl (
                         default: cntrl = 4'b0000;
                     endcase
                 end else begin
-                    // OPTIMIZATION: Check only func3[0] to distinguish SUB vs SRA
-                    // SUB: func3 = 000 (bit 0 = 0)
-                    // SRA: func3 = 101 (bit 0 = 1)
                     cntrl = func3[0] ? 4'b0111 : 4'b0001;  // SRA or SUB
                 end
             end           
@@ -392,7 +479,6 @@ module alu_cntrl (
                     3'b011: cntrl = 4'b1001;  // SLTIU
                     3'b100: cntrl = 4'b0100;  // XORI
                     3'b101: begin
-                        // Check func7[5] to distinguish SRLI vs SRAI
                         cntrl = func7[5] ? 4'b0111 : 4'b0110;  // SRAI or SRLI
                     end
                     3'b110: cntrl = 4'b0011;  // ORI
@@ -504,49 +590,23 @@ module mem_addr_mux (
     output logic [31:0] mem_addr
 );
     
-    assign mem_addr = mem_addr_src? alu_out:pc;
+    assign mem_addr = mem_addr_src ? alu_out : pc;
 
 endmodule
 
-
-// OPTIMIZATIONS:
-// - 3-bit state encoding (saves 1 flip-flop)
-// - 5-bit opcode checking (faster decode)
-// - Merged states for reduced cycle count
-// - Direct ALU output bypass
-// - Single-bit JAL/JALR check
-// - INSTRUCTION PREFETCH: Fetches next instruction during DECODE
-//
-// PREFETCH OPERATION:
-// - During S_DECODE: Start prefetch from PC+4, set prefetch_write=1
-// - During S_FETCH: If prefetch_valid=1, use prefetched instruction (0 cycles!)
-// - On branch/jump: Set prefetch_invalidate=1 to clear buffer
-//
-// UPDATE 1: Added use_prefetch_fetch output to only use prefetch during S_FETCH
-// This prevents the prefetch buffer from overwriting the current instruction
-//
-// UPDATE 2: IRWrite = 1 in BOTH branches of S_FETCH to ensure IR always updates
-//
-// STATE MACHINE:
-// S_FETCH              - Fetch instruction (or use prefetch), calculate PC+4
-// S_DECODE             - Decode instruction, read registers, START PREFETCH
-// S_EX_ALU_WB          - Execute ALU operation + writeback (MERGED)
-// S_EX_MEM_READ        - Calculate address + read memory + writeback (MERGED)
-// S_EX_MEM_WRITE       - Calculate address + write memory (MERGED)
-// S_EX_BRANCH          - Evaluate branch condition
-// S_EX_JUMP            - Execute jump instruction
-// S_BRANCH_TAKEN_FETCH - Calculate target + fetch instruction (MERGED)
-
+// ============================================================================
+// CONTROL FSM MODULE (Optimized with Prefetch + Byte/Halfword Support)
+// ============================================================================
 module control_fsm_optimized_prefetch (
     input logic clk,
     input logic rst,
     input logic [31:0] instruction,
     input logic branch_taken,
-    input logic prefetch_valid,  // Signal used to determine whether prefetch buffer output is valid
+    input logic prefetch_valid,
 
-    output logic prefetch_write,      // Write to prefetch buffer
-    output logic prefetch_invalidate, // Invalidate prefetch buffer
-    output logic use_prefetch_fetch,  // Only use prefetch during S_FETCH
+    output logic prefetch_write,
+    output logic prefetch_invalidate,
+    output logic use_prefetch_fetch,
 
     output logic MemRead,
     output logic MemWrite,
@@ -562,7 +622,9 @@ module control_fsm_optimized_prefetch (
     output logic [1:0] alu_src_b,
     output logic [1:0] mem_to_reg,
     output logic [1:0] ALUop,
-    output logic force_rs1_zero
+    output logic force_rs1_zero,
+    output logic [1:0] mem_size,   // NEW: Memory size (00=byte, 01=halfword, 10=word)
+    output logic mem_sign          // NEW: Sign extension (0=unsigned, 1=signed)
 );
 
     localparam S_FETCH              = 3'd0;
@@ -589,7 +651,7 @@ module control_fsm_optimized_prefetch (
 
     // Next state and control signal logic
     always_comb begin
-        // Default values (all signals inactive)
+        // Default values
         next_state     = S_FETCH;
         MemRead        = 1'b0;
         MemWrite       = 1'b0;
@@ -606,57 +668,45 @@ module control_fsm_optimized_prefetch (
         mem_to_reg     = 2'b00;
         ALUop          = 2'b00;
         force_rs1_zero = 1'b0;
+        mem_size       = 2'b10;  // Default: word
+        mem_sign       = 1'b0;   // Default: unsigned
         
-        // Prefetch defaults
         prefetch_write = 1'b0;
         prefetch_invalidate = 1'b0;
-        use_prefetch_fetch = 1'b0;  // By default don't use prefetch
+        use_prefetch_fetch = 1'b0;
 
         case (state)
-            // S_FETCH: Fetch instruction (or use prefetch), calculate PC+4
-            // PREFETCH OPTIMIZATION: If prefetch_valid=1, use prefetched instruction
-            // - Saves 1 cycle (0 cycles instead of 1 for fetch!)
-            // - Only first instruction requires actual memory fetch
             S_FETCH: begin
                 if (prefetch_valid) begin
-                    // On prefetch hit, use prefetched instruction (0 cycles!)
-                    MemRead = 1'b0;  // No memory read needed
-                    IRWrite = 1'b1;  // FIXED: Still write to IR!
-                    use_prefetch_fetch = 1'b1;  // USE PREFETCH ONLY DURING S_FETCH!
+                    MemRead = 1'b0;
+                    IRWrite = 1'b1;
+                    use_prefetch_fetch = 1'b1;
                 end else begin
-                    // On prefetch miss, fetch from memory (first instruction only)
                     MemRead = 1'b1;
                     IRWrite = 1'b1;
-                    mem_addr_src = 1'b0;  // Memory address = PC
-                    use_prefetch_fetch = 1'b0;  // Don't use prefetch
+                    mem_addr_src = 1'b0;
+                    use_prefetch_fetch = 1'b0;
                 end
                 
-                // ALU calculates PC+4 (always needed)
-                alu_src_a    = 1'b1;    // ALU A = PC
-                alu_src_b    = 2'b10;   // ALU B = 4 (constant)
-                ALUop        = 2'b00;   // ADD
-                ALUOutWrite  = 1'b1;    // Store PC+4 in ALUOut register
-                PCWrite      = 1'b1;    // Update PC to PC+4
+                alu_src_a    = 1'b1;
+                alu_src_b    = 2'b10;
+                ALUop        = 2'b00;
+                ALUOutWrite  = 1'b1;
+                PCWrite      = 1'b1;
                 
                 next_state   = S_DECODE;
             end
-            // S_DECODE: Decode instruction, read registers, START PREFETCH
-            // PREFETCH OPTIMIZATION: Start fetching next instruction from PC+4
-            // - Memory read from current PC (which is already PC+4)
-            // - Prefetch buffer will be ready for next S_FETCH
-            // IMPORTANT: use_prefetch_fetch=0 during DECODE to prevent overwriting
-            //            the current instruction with the prefetched instruction
+
             S_DECODE: begin
-                AWrite = 1'b1;  // Load A register with rs1
-                BWrite = 1'b1;  // Load B register with rs2
+                AWrite = 1'b1;
+                BWrite = 1'b1;
                 
-                // PREFETCH: Start fetching next instruction
-                MemRead = 1'b1;           // Enable memory read
-                mem_addr_src = 1'b0;     // Memory address = PC (already PC+4)
-                prefetch_write = 1'b1;    // Write to prefetch buffer
-                use_prefetch_fetch = 1'b0;  // DON'T use prefetch during DECODE!
+                MemRead = 1'b1;
+                mem_addr_src = 1'b0;
+                prefetch_write = 1'b1;
+                use_prefetch_fetch = 1'b0;
                 
-                // Decode instruction (5-bit opcode check)
+                // Decode instruction with byte/halfword support
                 case (opcode[6:2])
                     5'b01100: next_state = S_EX_ALU_WB;      // R-type ALU
                     5'b00100: next_state = S_EX_ALU_WB;      // I-type ALU
@@ -665,56 +715,88 @@ module control_fsm_optimized_prefetch (
                         next_state = S_EX_ALU_WB;
                     end
                     5'b00101: next_state = S_EX_ALU_WB;      // AUIPC
-                    5'b00000: next_state = S_EX_MEM_READ;    // Load
-                    5'b01000: next_state = S_EX_MEM_WRITE;   // Store
+                    5'b00000: begin                           // Load (lb, lh, lw, lbu, lhu)
+                        next_state = S_EX_MEM_READ;
+                        // Set memory size and sign extension based on funct3
+                        case (instruction[14:12])
+                            3'b000: begin  // LB (signed byte)
+                                mem_size = 2'b00;
+                                mem_sign = 1'b1;
+                            end
+                            3'b001: begin  // LH (signed halfword)
+                                mem_size = 2'b01;
+                                mem_sign = 1'b1;
+                            end
+                            3'b010: begin  // LW (word)
+                                mem_size = 2'b10;
+                                mem_sign = 1'b0;
+                            end
+                            3'b100: begin  // LBU (unsigned byte)
+                                mem_size = 2'b00;
+                                mem_sign = 1'b0;
+                            end
+                            3'b101: begin  // LHU (unsigned halfword)
+                                mem_size = 2'b01;
+                                mem_sign = 1'b0;
+                            end
+                            default: begin
+                                mem_size = 2'b10;
+                                mem_sign = 1'b0;
+                            end
+                        endcase
+                    end
+                    5'b01000: begin                           // Store (sb, sh, sw)
+                        next_state = S_EX_MEM_WRITE;
+                        // Set memory size based on funct3
+                        case (instruction[14:12])
+                            3'b000: mem_size = 2'b00;  // SB (byte)
+                            3'b001: mem_size = 2'b01;  // SH (halfword)
+                            3'b010: mem_size = 2'b10;  // SW (word)
+                            default: mem_size = 2'b10;
+                        endcase
+                    end
                     5'b11000: begin                           // Branch
                         next_state = S_EX_BRANCH;
-                        prefetch_invalidate = 1'b1;  // Invalidate prefetch (branch may change PC)
+                        prefetch_invalidate = 1'b1;
                     end
                     5'b11011: begin                           // JAL
                         next_state = S_EX_JUMP;
-                        prefetch_invalidate = 1'b1;  // Invalidate prefetch (jump changes PC)
+                        prefetch_invalidate = 1'b1;
                     end
                     5'b11001: begin                           // JALR
                         next_state = S_EX_JUMP;
-                        prefetch_invalidate = 1'b1;  // Invalidate prefetch (jump changes PC)
+                        prefetch_invalidate = 1'b1;
                     end
                     default: next_state = S_FETCH;
                 endcase
             end
-            // S_EX_ALU_WB: Execute ALU operation + writeback (MERGED STATE)
-            // - Executes ALU operation
-            // - Writes result directly to register file
-            // - Uses direct ALU output bypass (no ALUOut register delay)
-            // - Saves 1 cycle per ALU instruction (4 → 3 cycles, 25% faster)
-            // use_prefetch_fetch=0: Don't use prefetch during execution
+
             S_EX_ALU_WB: begin
-                ALUOutWrite = 1'b0;  // Don't write to ALUOut register (direct bypass)
-                RegWrite    = 1'b1;  // Write to register file immediately
-                mem_to_reg  = 2'b00; // Write data = ALU output (direct bypass)
-                use_prefetch_fetch = 1'b0;  // Don't use prefetch during execution
+                ALUOutWrite = 1'b0;
+                RegWrite    = 1'b1;
+                mem_to_reg  = 2'b00;
+                use_prefetch_fetch = 1'b0;
                 
-                // Configure ALU based on instruction type (5-bit opcode check)
                 case (opcode[6:2])
                     5'b01100: begin  // R-type
-                        alu_src_a = 1'b0;    // ALU A = A register (rs1)
-                        alu_src_b = 2'b00;   // ALU B = B register (rs2)
-                        ALUop     = 2'b10;   // Use func3 and func7
+                        alu_src_a = 1'b0;
+                        alu_src_b = 2'b00;
+                        ALUop     = 2'b10;
                     end
                     5'b00100: begin  // I-type ALU
-                        alu_src_a = 1'b0;    // ALU A = A register (rs1)
-                        alu_src_b = 2'b01;   // ALU B = immediate
-                        ALUop     = 2'b11;   // Use func3
+                        alu_src_a = 1'b0;
+                        alu_src_b = 2'b01;
+                        ALUop     = 2'b11;
                     end
                     5'b01101: begin  // LUI
-                        alu_src_a = 1'b0;    // ALU A = A register (forced to 0)
-                        alu_src_b = 2'b01;   // ALU B = immediate
-                        ALUop     = 2'b00;   // ADD (0 + immediate = immediate)
+                        alu_src_a = 1'b0;
+                        alu_src_b = 2'b01;
+                        ALUop     = 2'b00;
                     end
                     5'b00101: begin  // AUIPC
-                        alu_src_a = 1'b1;    // ALU A = PC
-                        alu_src_b = 2'b01;   // ALU B = immediate
-                        ALUop     = 2'b00;   // ADD (PC + immediate)
+                        alu_src_a = 1'b1;
+                        alu_src_b = 2'b01;
+                        ALUop     = 2'b00;
                     end
                     default: begin
                         alu_src_a = 1'b0;
@@ -725,111 +807,84 @@ module control_fsm_optimized_prefetch (
                 
                 next_state = S_FETCH;
             end
-            // S_EX_MEM_READ: Calculate address + read memory + writeback (MERGED)
-            // - Calculates memory address (rs1 + immediate)
-            // - Reads from memory (asynchronous, immediate)
-            // - Writes data to register file
-            // - Uses direct ALU output bypass for address
-            // - Saves 2 cycles per load (5 → 3 cycles, 40% faster)
-            // use_prefetch_fetch=0: Don't use prefetch during memory operations
+
             S_EX_MEM_READ: begin
-                ALUOutWrite = 1'b0;   // Don't write to ALUOut register
-                alu_src_a   = 1'b0;   // ALU A = A register (rs1, base address)
-                alu_src_b   = 2'b01;  // ALU B = immediate (offset)
-                ALUop       = 2'b00;  // ADD (rs1 + offset)
+                ALUOutWrite = 1'b0;
+                alu_src_a   = 1'b0;
+                alu_src_b   = 2'b01;
+                ALUop       = 2'b00;
                 
-                MemRead      = 1'b1;   // Enable memory read
-                mem_addr_src = 1'b1;  // Use ALU output directly (bypass ALUOut register)
+                MemRead      = 1'b1;
+                mem_addr_src = 1'b1;
                 
-                RegWrite     = 1'b1;   // Write to register file
-                mem_to_reg   = 2'b01;  // Write data = memory data (direct from memory)
-                use_prefetch_fetch = 1'b0;  // Don't use prefetch during memory operations
+                RegWrite     = 1'b1;
+                mem_to_reg   = 2'b01;
+                use_prefetch_fetch = 1'b0;
                 
                 next_state   = S_FETCH;
             end
-            // S_EX_MEM_WRITE: Calculate address + write memory (MERGED)
-            // - Calculates memory address (rs1 + immediate)
-            // - Writes rs2 value to memory
-            // - Uses direct ALU output bypass for address
-            // - Saves 1 cycle per store (4 → 3 cycles, 25% faster)
-            // use_prefetch_fetch=0: Don't use prefetch during memory operations
+
             S_EX_MEM_WRITE: begin
-                ALUOutWrite = 1'b0;   // Don't write to ALUOut register
-                alu_src_a   = 1'b0;   // ALU A = A register (rs1, base address)
-                alu_src_b   = 2'b01;  // ALU B = immediate (offset)
-                ALUop       = 2'b00;  // ADD (rs1 + offset)
+                ALUOutWrite = 1'b0;
+                alu_src_a   = 1'b0;
+                alu_src_b   = 2'b01;
+                ALUop       = 2'b00;
                 
-                MemWrite     = 1'b1;   // Enable memory write
-                mem_addr_src = 1'b1;  // Use ALU output directly (bypass ALUOut register)
-                // Note: Memory data input is B register (rs2 value), connected in top module
-                use_prefetch_fetch = 1'b0;  // Don't use prefetch during memory operations
+                MemWrite     = 1'b1;
+                mem_addr_src = 1'b1;
+                use_prefetch_fetch = 1'b0;
                 
                 next_state   = S_FETCH;
             end
-            // S_EX_BRANCH: Evaluate branch condition
-            // - ALU performs comparison (SUB for BEQ/BNE, SLT for others)
-            // - Branch evaluator determines if branch taken
-            // - If taken: go to S_BRANCH_TAKEN_FETCH
-            // - If not taken: go to S_FETCH (prefetch already valid!)
-            // use_prefetch_fetch=0: Don't use prefetch during branch evaluation
+
             S_EX_BRANCH: begin
-                alu_src_a   = 1'b0;   // ALU A = A register (rs1)
-                alu_src_b   = 2'b00;  // ALU B = B register (rs2)
-                ALUop       = 2'b01;  // Branch operation (SUB or SLT)
-                PCWriteCond = 1'b1;   // Enable conditional PC write
-                use_prefetch_fetch = 1'b0;  // Don't use prefetch during branch evaluation
+                alu_src_a   = 1'b0;
+                alu_src_b   = 2'b00;
+                ALUop       = 2'b01;
+                PCWriteCond = 1'b1;
+                use_prefetch_fetch = 1'b0;
                 
                 if (branch_taken)
                     next_state = S_BRANCH_TAKEN_FETCH;
                 else
-                    next_state = S_FETCH;  // Prefetch is still valid!
+                    next_state = S_FETCH;
             end
-            // S_EX_JUMP: Execute jump instruction (JAL or JALR)
-            // - Calculates jump target (PC + offset for JAL, rs1 + offset for JALR)
-            // - Writes return address (PC+4 from ALUOut register) to rd
-            // - Updates PC to jump target
-            // - Single-bit check for JAL vs JALR (opcode[3])
-            // use_prefetch_fetch=0: Don't use prefetch during jump execution
+
             S_EX_JUMP: begin
-                ALUOutWrite = 1'b0;   // Don't update ALUOut (holds PC+4 from FETCH)
-                RegWrite    = 1'b1;   // Write return address to rd
-                mem_to_reg  = 2'b10;  // Write data = ALUOut register (PC+4)
-                use_prefetch_fetch = 1'b0;  // Don't use prefetch during jump execution
+                ALUOutWrite = 1'b0;
+                RegWrite    = 1'b1;
+                mem_to_reg  = 2'b10;
+                use_prefetch_fetch = 1'b0;
                 
-                PCWrite     = 1'b1;   // Update PC to jump target
+                PCWrite     = 1'b1;
                 
-                alu_src_b   = 2'b01;  // ALU B = immediate (offset)
-                ALUop       = 2'b00;  // ADD
-                
-                // OPTIMIZATION: Single-bit check for JAL vs JALR
-                // JAL:  opcode = 1101111 (bit [3] = 1) → ALU A = PC
-                // JALR: opcode = 1100111 (bit [3] = 0) → ALU A = A register (rs1)
+                alu_src_b   = 2'b01;
+                ALUop       = 2'b00;
                 alu_src_a = opcode[3];
                 
                 next_state = S_FETCH;
             end
-            // S_BRANCH_TAKEN_FETCH: Calculate target + fetch instruction (MERGED)
-            // - Calculates branch target (PC + offset)
-            // - Fetches instruction from target address (asynchronous read)
-            // - Updates PC to branch target
-            // - Saves 1 cycle per taken branch (5 → 4 cycles, 20% faster)
-            // use_prefetch_fetch=0: Don't use prefetch 
+
             S_BRANCH_TAKEN_FETCH: begin
-                // Calculate branch target
-                ALUOutWrite = 1'b1;   // Store target in ALUOut register
-                alu_src_a   = 1'b1;   // ALU A = PC (current PC, which is PC+4)
-                alu_src_b   = 2'b01;  // ALU B = immediate (offset)
-                ALUop       = 2'b00;  // ADD (PC + offset = branch target)
-                use_prefetch_fetch = 1'b0;  // Don't use prefetch (fetching from new address)
+                // FIXED: Only compute branch target and write to PC.
+                // Don't fetch instruction here - let S_FETCH handle it.
+                // This ensures PC is properly advanced by 4 during FETCH,
+                // so the prefetch during DECODE reads the correct next instruction.
+                ALUOutWrite = 1'b0;
+                alu_src_a   = 1'b1;   // PC
+                alu_src_b   = 2'b01;  // immediate (branch offset)
+                ALUop       = 2'b00;  // ADD
+                use_prefetch_fetch = 1'b0;
                 
-                PCWrite     = 1'b1;   // Update PC to branch target
+                PCWrite     = 1'b1;   // Write branch target to PC
+                prefetch_invalidate = 1'b1;  // Invalidate prefetch
                 
-                // Fetch instruction from branch target (same cycle)
-                MemRead      = 1'b1;   // Enable memory read
-                IRWrite      = 1'b1;   // Load instruction register
-                mem_addr_src = 1'b1;  // Use ALU output directly (branch target)
+                // Don't fetch or write to IR - let S_FETCH do it
+                MemRead      = 1'b0;
+                IRWrite      = 1'b0;
+                mem_addr_src = 1'b0;
                 
-                next_state   = S_DECODE;
+                next_state   = S_FETCH;  // Go to normal FETCH
             end
 
             default: next_state = S_FETCH;
